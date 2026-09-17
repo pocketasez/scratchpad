@@ -1,0 +1,158 @@
+import bisect
+import glob
+import itertools
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import unicodedata
+import zlib
+
+BLANK, DWELL, END = 0.2, 0.6, 2.0 
+ABC = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+TOKEN = ( 
+    r'[{}\[\],:]|"[^"\\]*(?:\\.[^"\\]*)*"'
+    r"|-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?|true|false|null"
+)
+NON_ASCII = r"[^\x00-\x7f]"
+SAMPLE = "".join(chr(c) for c in range(32, 127))
+
+
+def main() -> None:
+    sys.stdout.reconfigure(encoding="utf-8")
+    cols, lines = term_size()
+    width = cols - 6
+    names = files(sys.argv[1:])
+    if not names:
+        sys.exit("no files matched; pass globs, e.g. 'src/**/*.py'")
+    folds = [("glyphs.txt", fold("t", [SAMPLE[:48], SAMPLE[48:]], "glyphs.txt", 48))]
+    for name in names:
+        is_json = name.endswith(".json")
+        folds.append((name, (fold_json if is_json else fold_text)(name, width)))
+    for name, rows in folds:
+        widest = max(cells(r) for r in rows)
+        if widest > width + 4:
+            sys.exit(f"{name}: a row is {widest} cells, over {width + 4}; not drawn")
+    draw(folds, cols, lines)
+
+
+def fold_text(name: str, width: int) -> list[str]:
+    with open(name, "rb") as fh:
+        data = fh.read()
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        text = data.decode("cp1252", errors="replace")
+        say(f"{name}: not UTF-8, read as Windows-1252; it comes back as UTF-8")
+    lines = [ln.rstrip("\r").expandtabs(4) for ln in text.split("\n")]
+    if lines[-1] == "":
+        lines.pop()
+    wide = "".join(sorted(c for c in set(re.findall(NON_ASCII, text)) if cells(c) > 1))
+    if wide:
+        say(f"{name}: double-width {wide}; those rows will not read back")
+    return fold("t", lines, name, width)
+
+
+def fold_json(name: str, width: int) -> list[str]:
+    try:
+        with open(name, encoding="utf-8") as fh:
+            mini = json.dumps(json.load(fh), separators=(",", ":"))
+    except ValueError as e:
+        sys.exit(f"{name}: not JSON ({e}); not drawn")
+    ends = list(itertools.accumulate(map(len, re.findall(TOKEN, mini))))
+    lines, start = [], 0
+    while start < len(mini):
+        i = bisect.bisect_right(ends, start + width) - 1
+        end = ends[i] if i >= 0 and ends[i] > start else start + width
+        lines.append(mini[start:end])
+        start = end
+    if "".join(lines) != mini:
+        sys.exit(f"{name}: fold is not lossless; not drawn")
+    return fold("j", lines, name, width)
+
+
+def fold(kind: str, lines: list[str], name: str, width: int) -> list[str]:
+    text = ("" if kind == "j" else "\n").join(lines)
+    head = f"#{kind}1 {len(lines)} {zlib.crc32(text.encode()):08x} {name}"
+    rows = []
+    for ln in [head, *lines]:
+        pieces = [ln[i : i + width] for i in range(0, len(ln), width)] or [""]
+        rows += [f"{check('+' + p)}+{p}" for p in pieces[:-1]]
+        rows.append(f"{check(pieces[-1])}|{pieces[-1]}")
+    return rows
+
+
+def draw(folds: list[tuple[str, list[str]]], cols: int, lines: int) -> None:
+    out = sys.stdout
+    out.write("\033[?25l")
+    try:
+        for page, screen in enumerate(screens(folds, cols, lines), 1):
+            if page > 1:
+                time.sleep(DWELL)
+            out.write("\033[3J\033[H\033[2J")
+            out.flush()
+            time.sleep(BLANK)
+            out.write(f"=== [SLIDE {page:04d}] {'=' * 50}\n{screen}")
+            out.flush()
+        time.sleep(END)
+    finally:
+        out.write("\033[?25h\n")
+        out.flush()
+
+
+def screens(folds: list[tuple[str, list[str]]], cols: int, lines: int) -> list[str]:
+    done, rows, used = [], [], 1
+    for name, fold in folds:
+        for row in ["", f"<<<FILE: _folded/{name}>>>", *fold]:
+            row = row.replace(" ", "·") + "¶\n"
+            n = (len(row) - 2) // (cols - 1) + 1
+            if used > 1 and used + n > lines - 2:
+                done.append("".join(rows))
+                rows, used = [], 1
+            rows.append(row)
+            used += n
+    return [*done, "".join(rows)]
+
+
+def files(patterns: list[str]) -> list[str]:
+    found = {}  
+    for pattern in patterns:
+        for f in sorted(glob.glob(pattern, recursive=True)):
+            if os.path.isfile(f):
+                found[f.replace(os.sep, "/")] = None
+    return list(found)
+
+
+def term_size() -> tuple[int, int]:
+    if os.environ.get("COLS") and os.environ.get("LINES"):
+        return int(os.environ["COLS"]), int(os.environ["LINES"])
+    if os.name == "nt":
+        os.system("") 
+    try:
+        size = os.get_terminal_size()
+        return size.columns, size.lines
+    except OSError:  
+        cols = subprocess.run(["tput", "cols"], capture_output=True).stdout
+        lines = subprocess.run(["tput", "lines"], capture_output=True).stdout
+        return int(cols), int(lines)
+
+
+def check(chunk: str) -> str:
+    n = zlib.crc32(chunk.encode()) & 0x7FFF
+    return ABC[n >> 10] + ABC[(n >> 5) & 31] + ABC[n & 31]
+
+
+def cells(s: str) -> int:
+    if s.isascii():
+        return len(s)
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
+
+
+def say(msg: str) -> None:
+    sys.stderr.write(msg + "\n")
+
+
+if __name__ == "__main__":
+    main()
