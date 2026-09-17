@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 import bisect
 import glob
 import itertools
@@ -10,9 +11,9 @@ import time
 import unicodedata
 import zlib
 
-BLANK, DWELL, END = 0.2, 0.6, 2.0 
+BLANK, DWELL, END = 0.2, 0.6, 2.0
 ABC = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
-TOKEN = ( 
+TOKEN = (
     r'[{}\[\],:]|"[^"\\]*(?:\\.[^"\\]*)*"'
     r"|-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?|true|false|null"
 )
@@ -105,8 +106,8 @@ def draw(folds: list[tuple[str, list[str]]], cols: int, lines: int) -> None:
 def screens(folds: list[tuple[str, list[str]]], cols: int, lines: int) -> list[str]:
     done, rows, used = [], [], 1
     for name, fold in folds:
-        for row in ["", f"<<<FILE: _folded/{name}>>>", *fold]:
-            row = row.replace(" ", "·") + "¶\n"
+        for row in ["", f"<<<FILE: {name}>>>", *fold]:
+            row += "¶\n"
             n = (len(row) - 2) // (cols - 1) + 1
             if used > 1 and used + n > lines - 2:
                 done.append("".join(rows))
@@ -117,23 +118,29 @@ def screens(folds: list[tuple[str, list[str]]], cols: int, lines: int) -> list[s
 
 
 def files(patterns: list[str]) -> list[str]:
-    found = {}  
+    found = set()
     for pattern in patterns:
-        for f in sorted(glob.glob(pattern, recursive=True)):
-            if os.path.isfile(f):
-                found[f.replace(os.sep, "/")] = None
-    return list(found)
+        matched = {
+            f.replace(os.sep, "/")
+            for expanded in braces(pattern)
+            for f in glob.glob(expanded, recursive=True)
+            if os.path.isfile(f)
+        }
+        if not matched:
+            say(f"{pattern}: matched nothing")
+        found |= matched
+    return sorted(found, key=lambda f: f.split("/"))
 
 
 def term_size() -> tuple[int, int]:
     if os.environ.get("COLS") and os.environ.get("LINES"):
         return int(os.environ["COLS"]), int(os.environ["LINES"])
     if os.name == "nt":
-        os.system("") 
+        os.system("")
     try:
         size = os.get_terminal_size()
         return size.columns, size.lines
-    except OSError:  
+    except OSError:
         cols = subprocess.run(["tput", "cols"], capture_output=True).stdout
         lines = subprocess.run(["tput", "lines"], capture_output=True).stdout
         return int(cols), int(lines)
@@ -148,6 +155,31 @@ def cells(s: str) -> int:
     if s.isascii():
         return len(s)
     return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
+
+
+def braces(pattern: str) -> list[str]:
+    i = pattern.find("{")
+    if i < 0:
+        return [pattern]
+    depth = 0
+    for j in range(i, len(pattern)):
+        depth += (pattern[j] == "{") - (pattern[j] == "}")
+        if depth == 0:
+            break
+    else:
+        return [pattern]
+    parts, depth, start = [], 0, i + 1
+    for k in range(i + 1, j):
+        depth += (pattern[k] == "{") - (pattern[k] == "}")
+        if pattern[k] == "," and depth == 0:
+            parts.append(pattern[start:k])
+            start = k + 1
+    parts.append(pattern[start:j])
+    if len(parts) == 1:
+        return [pattern[: j + 1] + rest for rest in braces(pattern[j + 1 :])]
+    return [
+        out for part in parts for out in braces(pattern[:i] + part + pattern[j + 1 :])
+    ]
 
 
 def say(msg: str) -> None:
