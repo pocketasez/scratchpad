@@ -21,6 +21,7 @@ TOKEN = (
 )
 NON_ASCII = r"[^\x00-\x7f]"
 SAMPLE = "".join(chr(c) for c in range(32, 127))
+FLAGS = ("--plain", "--no-ignore")
 
 
 def main() -> None:
@@ -29,7 +30,8 @@ def main() -> None:
     width = cols - 6
     args = sys.argv[1:]
     plain = "--plain" in args
-    names = files([a for a in args if a != "--plain"])
+    everything = "--no-ignore" in args
+    names = files([a for a in args if a not in FLAGS], everything)
     if not names:
         sys.exit("no files matched; pass globs, e.g. 'src/**/*.py'")
     folds = [("glyphs.txt", fold("t", [SAMPLE[:48], SAMPLE[48:]], "glyphs.txt", 48))]
@@ -128,7 +130,7 @@ def screens(folds: list[tuple[str, list[str]]], cols: int, lines: int) -> list[s
     return [*done, "".join(rows)]
 
 
-def files(patterns: list[str]) -> list[str]:
+def files(patterns: list[str], everything: bool = False) -> list[str]:
     found = set()
     for pattern in patterns:
         matched = {
@@ -140,6 +142,9 @@ def files(patterns: list[str]) -> list[str]:
         if not matched:
             say(f"{pattern}: matched nothing")
         found |= matched
+    if not everything and (skipped := ignored(found)):
+        say(f"{len(skipped)} gitignored file(s) not drawn; --no-ignore draws them")
+        found -= skipped
     return sorted(found, key=lambda f: f.split("/"))
 
 
@@ -248,6 +253,22 @@ def braces(pattern: str) -> list[str]:
     return [
         out for part in parts for out in braces(pattern[:i] + part + pattern[j + 1 :])
     ]
+
+
+def ignored(names: set[str]) -> set[str]:
+    if not names:
+        return set()
+    try:
+        done = subprocess.run(
+            ["git", "check-ignore", "--stdin", "-z"],
+            input="\0".join(names).encode(),
+            capture_output=True,
+        )
+    except OSError:
+        return set()
+    if done.returncode != 0:
+        return set()
+    return {n.replace(os.sep, "/") for n in done.stdout.decode().split("\0") if n}
 
 
 def say(msg: str) -> None:
