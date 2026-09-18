@@ -1,8 +1,10 @@
 #!/usr/bin/env python
+import base64
 import bisect
 import glob
 import itertools
 import json
+import lzma
 import os
 import re
 import subprocess
@@ -11,7 +13,7 @@ import time
 import unicodedata
 import zlib
 
-BLANK, DWELL, END = 0.2, 0.6, 2.0
+BLANK, DWELL, END = 0.2, 0.7, 2.0
 ABC = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 TOKEN = (
     r'[{}\[\],:]|"[^"\\]*(?:\\.[^"\\]*)*"'
@@ -25,13 +27,14 @@ def main() -> None:
     sys.stdout.reconfigure(encoding="utf-8")
     cols, lines = term_size()
     width = cols - 6
-    names = files(sys.argv[1:])
+    args = sys.argv[1:]
+    plain = "--plain" in args
+    names = files([a for a in args if a != "--plain"])
     if not names:
         sys.exit("no files matched; pass globs, e.g. 'src/**/*.py'")
     folds = [("glyphs.txt", fold("t", [SAMPLE[:48], SAMPLE[48:]], "glyphs.txt", 48))]
     for name in names:
-        is_json = name.endswith(".json")
-        folds.append((name, (fold_json if is_json else fold_text)(name, width)))
+        folds.append((name, fold_file(name, width, plain)))
     for name, rows in folds:
         widest = max(cells(r) for r in rows)
         if widest > width + 4:
@@ -40,23 +43,10 @@ def main() -> None:
 
 
 def fold_text(name: str, width: int) -> list[str]:
-    with open(name, "rb") as fh:
-        data = fh.read()
-    try:
-        text = data.decode("utf-8")
-    except UnicodeDecodeError:
-        text = data.decode("cp1252", errors="replace")
-        say(f"{name}: not UTF-8, read as Windows-1252; it comes back as UTF-8")
-    lines = [ln.rstrip("\r").expandtabs(4) for ln in text.split("\n")]
-    if lines[-1] == "":
-        lines.pop()
-    wide = "".join(sorted(c for c in set(re.findall(NON_ASCII, text)) if cells(c) > 1))
-    if wide:
-        say(f"{name}: double-width {wide}; those rows will not read back")
-    return fold("t", lines, name, width)
+    return fold("t", read_lines(name), name, width)
 
 
-def fold_json(name: str, width: int) -> list[str]:
+def fold_json(name: str, width: int, plain: bool = False) -> list[str]:
     try:
         with open(name, encoding="utf-8") as fh:
             mini = json.dumps(json.load(fh), separators=(",", ":"))
@@ -71,18 +61,39 @@ def fold_json(name: str, width: int) -> list[str]:
         start = end
     if "".join(lines) != mini:
         sys.exit(f"{name}: fold is not lossless; not drawn")
-    return fold("j", lines, name, width)
+    as_json = fold("j", lines, name, width)
+    if plain:
+        return as_json
+    return min(as_json, fold_compressed(name, width, mini), key=len)
 
 
 def fold(kind: str, lines: list[str], name: str, width: int) -> list[str]:
     text = ("" if kind == "j" else "\n").join(lines)
     head = f"#{kind}1 {len(lines)} {zlib.crc32(text.encode()):08x} {name}"
-    rows = []
-    for ln in [head, *lines]:
-        pieces = [ln[i : i + width] for i in range(0, len(ln), width)] or [""]
-        rows += [f"{check('+' + p)}+{p}" for p in pieces[:-1]]
-        rows.append(f"{check(pieces[-1])}|{pieces[-1]}")
-    return rows
+    return rows_of(head, lines, width)
+
+
+def fold_compressed(name: str, width: int, text: str | None = None) -> list[str]:
+    if text is None:
+        text = "\n".join(read_lines(name))
+    packed = lzma.compress(text.encode(), preset=9 | lzma.PRESET_EXTREME)
+    blob = base64.a85encode(packed).decode()
+    chunks = [blob[i : i + width] for i in range(0, len(blob), width)] or [""]
+    lines = len(text.split("\n")) if text else 0
+    head = f"#z1 {lines} {zlib.crc32(text.encode()):08x} {name}"
+    return rows_of(head, chunks, width)
+
+
+def fold_packed(name: str, width: int) -> list[str]:
+    lines = read_lines(name)
+    sep = separator("\n".join(lines))
+    if sep is None:
+        say(f"{name}: holds every printable character; drawn a line per row")
+        return fold("t", lines, name, width)
+    packed = sep.join(lines)
+    chunks = [packed[i : i + width] for i in range(0, len(packed), width)] or [""]
+    crc = zlib.crc32("\n".join(lines).encode())
+    return rows_of(f"#c1{sep} {len(lines)} {crc:08x} {name}", chunks, width)
 
 
 def draw(folds: list[tuple[str, list[str]]], cols: int, lines: int) -> None:
@@ -144,6 +155,63 @@ def term_size() -> tuple[int, int]:
         cols = subprocess.run(["tput", "cols"], capture_output=True).stdout
         lines = subprocess.run(["tput", "lines"], capture_output=True).stdout
         return int(cols), int(lines)
+
+
+def fold_file(name: str, width: int, plain: bool = False) -> list[str]:
+    if name.endswith(".json"):
+        return fold_json(name, width, plain)
+    if plain:
+        return fold_text(name, width)
+    if name.endswith((".csv", ".tsv")):
+        return fold_data(name, width)
+    return fold_smallest(name, width)
+
+
+def fold_smallest(name: str, width: int) -> list[str]:
+    return min(fold_text(name, width), fold_compressed(name, width), key=len)
+
+
+def fold_data(name: str, width: int) -> list[str]:
+    return min(
+        fold_text(name, width),
+        fold_packed(name, width),
+        fold_compressed(name, width),
+        key=len,
+    )
+
+
+def rows_of(head: str, lines: list[str], width: int) -> list[str]:
+    rows = []
+    for ln in [head, *lines]:
+        pieces = [ln[i : i + width] for i in range(0, len(ln), width)] or [""]
+        rows += [f"{check('+' + p)}+{p}" for p in pieces[:-1]]
+        rows.append(f"{check(pieces[-1])}|{pieces[-1]}")
+    return rows
+
+
+def read_lines(name: str) -> list[str]:
+    with open(name, "rb") as fh:
+        data = fh.read()
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        text = data.decode("cp1252", errors="replace")
+        say(f"{name}: not UTF-8, read as Windows-1252; it comes back as UTF-8")
+    lines = [ln.rstrip("\r").expandtabs(4) for ln in text.split("\n")]
+    if lines[-1] == "":
+        lines.pop()
+    wide = "".join(sorted(c for c in set(re.findall(NON_ASCII, text)) if cells(c) > 1))
+    if wide:
+        say(f"{name}: double-width {wide}; those rows will not read back")
+    return lines
+
+
+def separator(text: str) -> str | None:
+    held = set(text)
+    for c in "~`^!#$%&*+;?@=<>()[]{}'\"\\/:,.-_":
+        if c not in held:
+            return c
+    return None
 
 
 def check(chunk: str) -> str:
